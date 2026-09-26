@@ -6,7 +6,9 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.partnerssolutions.caroline.companion.data.remote.CamerlengoRepository
+import com.partnerssolutions.caroline.companion.util.retryOnce
 import kotlinx.coroutines.launch
+import java.io.IOException
 
 class LoginViewModel(private val repository: CamerlengoRepository = CamerlengoRepository()) : ViewModel() {
     var email by mutableStateOf("")
@@ -25,8 +27,20 @@ class LoginViewModel(private val repository: CamerlengoRepository = CamerlengoRe
         error = null
         viewModelScope.launch {
             try {
-                repository.login(email.trim(), password)
+                // retryOnce: per real incident (2026-09-26) -- a raw
+                // SocketTimeoutException (message literally "timeout",
+                // OkHttpClient has no explicit timeouts configured) from a
+                // cold-start network hiccup surfaced here verbatim, easily
+                // mistaken for a problem with what was typed rather than a
+                // one-off network stumble. See retryOnce's own doc comment.
+                retryOnce { repository.login(email.trim(), password) }
                 onSuccess()
+            } catch (exc: IOException) {
+                // A real network failure (timeout, no connection, DNS) --
+                // distinct from CamerlengoException (a clean server answer
+                // like "Invalid username or password"), so say so plainly
+                // instead of showing the raw "timeout"/exception text.
+                error = "Network timeout -- check your connection and try again."
             } catch (exc: Exception) {
                 error = exc.message ?: "Login failed."
             } finally {

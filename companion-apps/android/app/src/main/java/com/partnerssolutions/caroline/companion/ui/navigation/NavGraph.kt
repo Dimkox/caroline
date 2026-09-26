@@ -22,6 +22,7 @@ import com.partnerssolutions.caroline.companion.ui.companion.CompanionSetupScree
 import com.partnerssolutions.caroline.companion.ui.login.LoginScreen
 import com.partnerssolutions.caroline.companion.ui.tabs.CompanionTabsScreen
 import com.partnerssolutions.caroline.companion.util.Logger
+import com.partnerssolutions.caroline.companion.util.retryOnce
 
 private enum class AutoLoginState { CHECKING, LOGGED_IN, LOGGED_OUT }
 
@@ -47,7 +48,12 @@ fun NavGraph(navController: NavHostController = rememberNavController()) {
             return@LaunchedEffect
         }
         autoLoginState = try {
-            CamerlengoRepository().login(creds.email, creds.password)
+            // retryOnce: per real incident (2026-09-26), a bare single
+            // attempt here made a cold-start network hiccup look exactly
+            // like "credentials weren't picked up" -- the user got bounced
+            // to LoginScreen even though CredentialsStore still had a
+            // perfectly good saved login. See retryOnce's own doc comment.
+            retryOnce { CamerlengoRepository().login(creds.email, creds.password) }
             Logger.i("auto-login from stored credentials succeeded")
             AutoLoginState.LOGGED_IN
         } catch (exc: Exception) {
