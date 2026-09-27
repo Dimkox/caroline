@@ -2,12 +2,17 @@ package com.partnerssolutions.caroline.companion.data.companion
 
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
+import android.os.PowerManager
+import android.provider.Settings
 import android.telephony.SubscriptionManager
 import android.telephony.TelephonyManager
 import androidx.core.content.ContextCompat
+import com.partnerssolutions.caroline.companion.service.CompanionOpsService
 import java.util.UUID
 
 /** Every runtime permission CompanionOpsService needs to do its job --
@@ -31,15 +36,48 @@ fun companionPermissionsGranted(context: Context): Boolean =
     COMPANION_REQUIRED_PERMISSIONS.all { ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED }
 
 /**
- * One persisted flag: has the user explicitly opted into the SMS/contacts
- * phone-companion feature (CompanionOpsService)? Plain (unencrypted)
- * SharedPreferences -- unlike CredentialsStore this holds no secret, just
- * a boolean the app checks on every process start to decide whether to
- * auto-start the foreground service (see CompanionApplication.onCreate).
- * Real permission grants are re-checked independently at that same
- * point -- this flag alone never bypasses Android's own permission system,
- * it only remembers "the user said yes" so they aren't re-asked the intro
- * screen every launch.
+ * Turns the SMS/contacts companion on: saves [phoneNumber], marks it
+ * enabled, starts CompanionOpsService, and (best-effort) asks the user to
+ * exempt the app from battery optimization. Shared by the automatic
+ * first-launch activation (CompanionTabsScreen) and CompanionSetupScreen's
+ * own manual re-enable path (e.g. after the user had switched it off), so
+ * there is exactly one place that does this, not two copies drifting apart.
+ *
+ * Per explicit instruction (2026-09-27), reversing the 2026-09-24 opt-in
+ * decision: the feature now activates itself automatically once Android's
+ * OWN permission dialogs are granted, instead of waiting for the user to
+ * find CompanionSetupScreen and flip a switch. Calling this does NOT
+ * itself request permissions -- callers must already hold them (see
+ * companionPermissionsGranted) or be inside a permission-grant callback.
+ */
+fun activateCompanionService(context: Context, phoneNumber: String) {
+    CompanionPrefs.phoneNumber = phoneNumber
+    CompanionPrefs.enabled = true
+    CompanionOpsService.start(context)
+    val powerManager = context.getSystemService(PowerManager::class.java)
+    if (powerManager?.isIgnoringBatteryOptimizations(context.packageName) == false) {
+        context.startActivity(
+            Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:${context.packageName}")),
+        )
+    }
+}
+
+/**
+ * One persisted flag: is the SMS/contacts phone-companion feature
+ * (CompanionOpsService) currently on? Plain (unencrypted) SharedPreferences
+ * -- unlike CredentialsStore this holds no secret, just a boolean the app
+ * checks on every process start to decide whether to auto-start the
+ * foreground service (see CompanionApplication.onCreate).
+ *
+ * Per explicit instruction (2026-09-27): this used to mean "the user
+ * explicitly opted in" (CompanionSetupScreen's switch was the only way to
+ * flip it true) -- now CompanionTabsScreen sets it automatically the first
+ * time Android's own permission dialogs are granted (see
+ * activateCompanionService), so it instead means "the feature is currently
+ * running" -- still user-overridable (the switch can turn it back off),
+ * just no longer gated behind finding a menu first. Real permission grants
+ * are re-checked independently on every process start regardless of this
+ * flag's value -- it alone never bypasses Android's own permission system.
  */
 object CompanionPrefs {
     private const val FILE_NAME = "companion_prefs"
@@ -78,12 +116,14 @@ object CompanionPrefs {
             return fresh
         }
 
-    /** The user-CONFIRMED number for this phone, set by CompanionSetupScreen
-     * -- null until setup has been completed at least once. This is what
-     * gets published in this device's own heartbeat (devices/<deviceId>/
-     * info) and what Caroline's fromNumber matching is done against.
-     * Never set silently from bestEffortDetectedNumber without the user
-     * having seen/confirmed it in the setup screen's text field. */
+    /** This phone's number, published in this device's own heartbeat
+     * (devices/<deviceId>/info) and what Caroline's fromNumber matching is
+     * done against -- null until it's been set at least once, either
+     * automatically (CompanionTabsScreen re-detects and saves this on every
+     * launch via bestEffortDetectedNumber, per explicit instruction
+     * 2026-09-27) or manually (CompanionSetupScreen's text field, which
+     * always wins for the rest of that launch -- the auto-detect-on-launch
+     * pass is what can override it again, not anything mid-session). */
     var phoneNumber: String?
         get() = prefs?.getString(KEY_PHONE_NUMBER, null)
         set(value) {
@@ -91,12 +131,17 @@ object CompanionPrefs {
         }
 
     /**
-     * Best-effort OS-reported number, to PREFILL the setup screen's
-     * confirmation field -- never used as `phoneNumber` directly, because
+     * Best-effort OS-reported number. Per explicit instruction (2026-09-27)
+     * this now feeds `phoneNumber` automatically (CompanionTabsScreen, on
+     * every launch) rather than only prefilling a field the user had to
+     * confirm -- but it stays best-effort, not authoritative:
      * getLine1Number()/SubscriptionManager frequently return null or an
      * empty string depending on carrier and SIM state, even when
-     * READ_PHONE_NUMBERS is granted. Returns null on any failure or
-     * missing permission rather than throwing.
+     * READ_PHONE_NUMBERS is granted, which is exactly why a null result
+     * here leaves `phoneNumber` alone rather than clearing it -- a manual
+     * entry from a previous launch survives until detection actually
+     * produces something to replace it with. Returns null on any failure
+     * or missing permission rather than throwing.
      */
     fun bestEffortDetectedNumber(context: Context): String? {
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_NUMBERS)

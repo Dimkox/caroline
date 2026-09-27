@@ -27,59 +27,35 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.partnerssolutions.caroline.companion.data.companion.COMPANION_REQUIRED_PERMISSIONS
 import com.partnerssolutions.caroline.companion.data.companion.CompanionPrefs
+import com.partnerssolutions.caroline.companion.data.companion.activateCompanionService
 import com.partnerssolutions.caroline.companion.data.companion.companionPermissionsGranted
 import com.partnerssolutions.caroline.companion.service.CompanionOpsService
 
 /**
- * Consent + control screen for the SMS/contacts phone companion
- * (CompanionOpsService) -- per explicit instruction (2026-09-24), this is
- * opt-in, not auto-started after login: sending a real SMS is a real-
- * world-consequence action, and the foreground service's persistent
- * notification shouldn't appear without the user having explicitly asked
- * for the feature. Reachable from CompanionTabsScreen's overflow menu.
+ * Review/control screen for the SMS/contacts phone companion
+ * (CompanionOpsService) and this phone's confirmed number. Reachable from
+ * CompanionTabsScreen's overflow menu.
  *
- * Multi-phone support (explicit instruction, 2026-09-26) added the phone
- * number field below: Caroline distinguishes paired phones BY NUMBER, and
- * Android frequently can't report this phone's own number reliably on its
- * own (see CompanionPrefs.bestEffortDetectedNumber's own doc comment), so
- * the user confirms/corrects it here rather than the feature silently
- * pairing under a blank or wrong number.
+ * Per explicit instruction (2026-09-27), reversing the 2026-09-24 opt-in
+ * decision: the feature is no longer gated behind finding this screen --
+ * CompanionTabsScreen activates it automatically the first time Android's
+ * own permission dialogs are granted. This screen is now where the user
+ * reviews that, corrects the number if auto-detection got it wrong (see
+ * CompanionPrefs.bestEffortDetectedNumber's own doc comment for why it's
+ * best-effort, not authoritative), or opts back OUT with the switch.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun CompanionSetupScreen(onBack: () -> Unit) {
     val context = LocalContext.current
     var enabled by remember { mutableStateOf(CompanionPrefs.enabled && companionPermissionsGranted(context)) }
-    var phoneNumber by remember {
-        mutableStateOf(CompanionPrefs.phoneNumber ?: CompanionPrefs.bestEffortDetectedNumber(context) ?: "")
-    }
+    var phoneNumber by remember { mutableStateOf(CompanionPrefs.phoneNumber ?: "") }
     val numberValid = phoneNumber.trim().length >= 7
-
-    fun activate() {
-        CompanionPrefs.phoneNumber = phoneNumber
-        CompanionPrefs.enabled = true
-        CompanionOpsService.start(context)
-        enabled = true
-        // Ask the user to exempt this app from battery optimization so the
-        // service survives aggressive OEM power managers (Xiaomi/Huawei/
-        // Samsung, etc.) -- same fix Ratatosk's own always-on sync service
-        // already needed. A system dialog the user can decline; the service
-        // still runs without this, just less reliably on those ROMs (see
-        // CompanionOpsService's own onTaskRemoved/BootReceiver fallbacks).
-        val powerManager = context.getSystemService(android.os.PowerManager::class.java)
-        if (powerManager?.isIgnoringBatteryOptimizations(context.packageName) == false) {
-            context.startActivity(
-                android.content.Intent(
-                    android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
-                    android.net.Uri.parse("package:${context.packageName}"),
-                ),
-            )
-        }
-    }
 
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
         if (results.values.all { it }) {
-            activate()
+            activateCompanionService(context, phoneNumber)
+            enabled = true
         } else {
             // Partial grant is not good enough (sending needs SEND_SMS,
             // lookups need READ_SMS/READ_CONTACTS) -- leave it off rather
@@ -108,15 +84,22 @@ fun CompanionSetupScreen(onBack: () -> Unit) {
             )
             OutlinedTextField(
                 value = phoneNumber,
-                onValueChange = { phoneNumber = it },
+                onValueChange = {
+                    phoneNumber = it
+                    // Always editable now (auto-detection runs on every
+                    // launch and CompanionTabsScreen may already have
+                    // turned the feature on before the user ever opens
+                    // this screen) -- persist corrections immediately so a
+                    // wrong auto-detected number can actually be fixed.
+                    CompanionPrefs.phoneNumber = it
+                },
                 label = { Text("This phone's number") },
                 supportingText = {
                     Text(
-                        if (numberValid) "Used so Caroline can tell this phone apart from any others you pair."
+                        if (numberValid) "Auto-detected where possible; correct it here if it's wrong."
                         else "Android often can't detect this automatically -- please enter it.",
                     )
                 },
-                enabled = !enabled,
                 modifier = Modifier.fillMaxWidth(),
             )
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -126,7 +109,8 @@ fun CompanionSetupScreen(onBack: () -> Unit) {
                     onCheckedChange = { turnOn ->
                         if (turnOn) {
                             if (companionPermissionsGranted(context)) {
-                                activate()
+                                activateCompanionService(context, phoneNumber)
+                                enabled = true
                             } else {
                                 permissionLauncher.launch(COMPANION_REQUIRED_PERMISSIONS)
                             }
