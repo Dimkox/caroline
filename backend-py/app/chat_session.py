@@ -363,13 +363,29 @@ FORCED_COMPACTION_HOURLY_MS = 3_600_000
 # Bug fix (2026-09-15): replaced the old byte-based growth threshold (see
 # tokens_at_last_forced_compaction's own __init__ comment for why bytes was
 # the wrong signal) -- this is real context tokens, checked against
-# last_known_context_tokens - tokens_at_last_forced_compaction. Own choice
-# of value, not a measured constant: the one real compaction observed live
-# fired at pre_tokens=69422 and left post_tokens=10158, so 60k of NEW
-# growth since the last compaction is a reasonably generous margin below
-# that (compacts again well before context gets that large again) without
-# re-compacting on every small turn.
-FORCED_COMPACTION_GROWTH_TOKENS_THRESHOLD = 60_000
+# last_known_context_tokens - tokens_at_last_forced_compaction.
+#
+# Raised (2026-09-27), per explicit instruction, after measuring the real cost live: 60k
+# was an own-choice guess made back when native auto-compaction (see FORCED_COMPACTION_
+# HOURLY_MS's own comment) had NEVER fired even once (0 observed) -- the whole reason this
+# workaround exists at all. It has since fired for real 6 times, at pre_tokens ranging
+# 504,971 to 1,255,769 (median ~744k) -- the model's own real threshold is nowhere near
+# 60k. Meanwhile this "growth" reason alone had forced 210 of 323 total compactions,
+# median pre_tokens 79,455 -- i.e. this app was paying for a full-context compaction call
+# (itself real, billed tokens, not free housekeeping) 6-15x more conservatively, and about
+# 35x more often, than the model actually needed, which is the direct, measured cause of
+# both "compaction happens more than it should" and "tokens burn faster than the VS Code
+# extension" (which has no forced compaction at all and just lets the model's own real
+# threshold govern). Also, this fires alongside today's separate reconnect-frequency
+# fixes (the hang-ceiling reset, the WinError-206 system-prompt-file change) -- fewer
+# involuntary reconnects is exactly the condition the original 0-observed-auto-compactions
+# finding blamed for auto-compaction never getting a long enough uninterrupted stretch to
+# fire on its own, so native auto-compaction firing reliably now is also the reason the
+# margin below can be this narrow with the SAME confidence the original 60k had.
+# 400k keeps a ~100k safety margin under the lowest real threshold observed (504,971) --
+# compacts again well before context gets that large -- while cutting how often this
+# fires by roughly the same 6-15x the threshold itself was too conservative by.
+FORCED_COMPACTION_GROWTH_TOKENS_THRESHOLD = 400_000
 # Minimum gap between two forced compactions on the same tab, regardless of
 # which trigger fires -- keeps the three triggers from stacking (e.g. the
 # hourly clock and the growth threshold both crossing within the same
