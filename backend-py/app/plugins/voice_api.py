@@ -1,7 +1,7 @@
 """Ports backend/src/voice.ts -- TTS/STT/language-detection/cheap-image-
-description via Camerlengo, plus the local edge-tts fallback path for TTS.
-Used by app/main.py's tts/stt control_request ops and by
-app_browser_plugin.py's app_browser_describe.
+description via Camerlengo, plus the local (in-process) edge-tts path for
+TTS -- see app.local_edge_tts. Used by app/main.py's tts/stt control_request
+ops and by app_browser_plugin.py's app_browser_describe.
 """
 
 from __future__ import annotations
@@ -11,16 +11,8 @@ import json
 import re
 from typing import Any
 
-import httpx
-
 from app.logging_setup import log_event
 from app.plugins.sw_api import CAROLINE_SW_KEY, _post_json
-
-LOCAL_TTS_PORT = 9414
-
-
-def local_tts_url() -> str:
-    return f"http://127.0.0.1:{LOCAL_TTS_PORT}/tts"
 
 
 class VoiceApiError(Exception):
@@ -787,22 +779,23 @@ async def generate_progress_comment(
 
 
 async def _synthesize_speech_locally(text: str, voice: str) -> str:
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        last_err: Exception | None = None
-        for attempt in range(3):
-            try:
-                res = await client.post(local_tts_url(), json={"text": text, "voice": voice})
-                break
-            except httpx.TransportError as exc:
-                last_err = exc
-                if attempt < 2:
-                    import asyncio
-                    await asyncio.sleep(0.5 * (attempt + 1))
-        else:
-            raise last_err  # type: ignore[misc]
-        if res.status_code >= 400:
-            raise VoiceApiError(f"local TTS server returned {res.status_code}: {res.text[:300]}")
-        return base64.b64encode(res.content).decode("ascii")
+    # Bug fix (2026-09-27), per explicit instruction: used to POST to a separate
+    # local_tts_server.py subprocess over HTTP (port 9414) -- ported as-is from the old
+    # Node.js backend, where that indirection was the only way to reach a Python TTS
+    # library at all. backend-py IS Python, so this now calls app.local_edge_tts (itself
+    # ported from reforce's own hardened EdgeTTS.py) directly, in-process: no subprocess
+    # to launch/supervise, no HTTP round trip, and -- the actual fix for the real
+    # incident this replaces -- a real connect/receive timeout on the underlying edge-tts
+    # call, where the old subprocess had none at all and a single stuck request leaked a
+    # worker thread forever (confirmed live: 0 of 14 real requests succeeded in one
+    # session once that happened, every one paying Camerlengo's slow ai:tts fallback
+    # instead, 20-97s even for a few words).
+    from app.local_edge_tts import EdgeTtsOptions, synthesize_to_bytes
+
+    audio = await synthesize_to_bytes(text, EdgeTtsOptions(voice=voice))
+    if not audio:
+        raise VoiceApiError("local edge-tts returned no audio")
+    return base64.b64encode(audio).decode("ascii")
 
 
 async def _synthesize_speech_via_camerlengo(text: str, voice: str, session: str | None = None) -> str:

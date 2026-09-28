@@ -1423,10 +1423,12 @@ async def ws_endpoint(websocket: WebSocket) -> None:
 if __name__ == "__main__":
     import uvicorn
 
-    from app.local_tts_launcher import launch_local_tts_server
     from app.skills_seed import seed_skills
 
     log_event("engine", "starting", port=PORT, workspace_dir=WORKSPACE_DIR)
     seed_skills(WORKSPACE_DIR)
-    launch_local_tts_server()
+    # Bug fix (2026-09-27), per explicit instruction: no longer launches
+    # local_tts_server.py as a separate subprocess -- see voice_api.py's
+    # _synthesize_speech_locally for why (in-process app.local_edge_tts now,
+    # this file/launcher was leftover from the old Node.js backend).
     uvicorn.run(app, host="127.0.0.1", port=PORT)
