@@ -85,6 +85,30 @@ public partial class MainWindow : Window
         _tray.OpenRequested += (_, _) => Dispatcher.Invoke(ShowAndActivate);
         _tray.ExitRequested += (_, _) => Dispatcher.Invoke(RequestExit);
         _tray.UpdateRequested += (_, _) => UpdateRequested?.Invoke(this, EventArgs.Empty);
+
+        _iconReinstallTimer = new System.Windows.Threading.DispatcherTimer { Interval = IconReinstallInterval };
+        _iconReinstallTimer.Tick += (_, _) => ReinstallWindowIcon();
+        _iconReinstallTimer.Start();
+    }
+
+    // Per explicit instruction (2026-09-28): the taskbar button showed the generic Windows
+    // placeholder icon on first launch (confirmed live by screenshot) -- so the window icon is
+    // re-applied on a flat 10s interval for the whole process lifetime, not just once.
+    // A fresh BitmapFrame each time (not the same instance) so WPF sees a real property
+    // change and re-sends WM_SETICON to the shell.
+    private static readonly TimeSpan IconReinstallInterval = TimeSpan.FromSeconds(10);
+    private readonly System.Windows.Threading.DispatcherTimer _iconReinstallTimer;
+
+    private void ReinstallWindowIcon()
+    {
+        try
+        {
+            Icon = System.Windows.Media.Imaging.BitmapFrame.Create(new Uri("pack://application:,,,/Resources/app.ico"));
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"MainWindow: ReinstallWindowIcon failed: {ex.Message}");
+        }
     }
 
     /// <summary>Bubbles up the tray's "Update to ..." click -- App.xaml.cs owns the
@@ -1236,6 +1260,7 @@ public partial class MainWindow : Window
         _settings.WindowHeight = Height;
         _settingsService.Save(_settings);
 
+        _iconReinstallTimer.Stop();
         _tray.Dispose();
         _hotkey?.Dispose();
         _supervisorStatusTimer?.Dispose();
