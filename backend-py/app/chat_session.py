@@ -3172,7 +3172,16 @@ class ChatSession:
             "message": {"role": "assistant", "content": [{"type": "text", "text": comment}], "model": None, "stop_reason": None},
             "session_id": None, "parent_tool_use_id": None,
         }
-        await self.send({"type": "sdk_message", "message": wire})
+        # Bug fix (2026-09-27), confirmed live ("сообщения нарратора вообще не
+        # озвучиваются"): every other send site attaches "isVoice" at the top level of
+        # this envelope (see _push_message/the ResultMessage handler) -- chat.js's own
+        # auto-speak gate (playOneSpeech's caller) fires ONLY when evt.isVoice is truthy;
+        # missing here meant it was always undefined for a narration message, so it never
+        # auto-spoke, in Visual Mode or otherwise, regardless of whether the turn it's
+        # narrating about was itself voice-started. Uses self.turn_is_voice, same as the
+        # other real send sites, so narration follows the SAME voice/silent choice the
+        # turn it's commenting on already made.
+        await self.send({"type": "sdk_message", "message": wire, "isVoice": self.turn_is_voice})
 
     def _check_user_wait_nudge(self) -> None:
         """Separate from hang-detection above -- that guards against a
@@ -3883,6 +3892,16 @@ class ChatSession:
             # raced the splash-dismiss/SyncTabListToBackend timing and
             # produced a window with a missing tab list.
             "forcedCompactionPending": self.forced_compaction_result_pending,
+            # Bug fix (2026-09-27), found while building the Python supervisor
+            # (see backend-py/supervisor.py): MainWindow.RecoverTab (formerly
+            # C#, now that supervisor's per-tab watchdog) reads this exact key
+            # to know which OS process to kill for a stuck tab WITHOUT taking
+            # the whole backend down -- it was never actually populated here,
+            # so per-tab recovery silently no-opped every time ("no
+            # cliProcessPid known for this tab yet") no matter how long a turn
+            # had been stuck. self._cli_process_pid is captured at spawn time
+            # (win_subprocess_patch.py's pid sink) -- just never surfaced.
+            "cliProcessPid": self._cli_process_pid,
         }
 
     # ------------------------------------------------------------- run loop --
