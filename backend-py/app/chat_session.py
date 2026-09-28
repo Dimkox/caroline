@@ -531,7 +531,7 @@ _SYNTHETIC_HISTORY_TEXT_PATTERNS = [
     re.compile(r"^This session is being continued from a previous conversation", re.IGNORECASE),
     # Bug fix (2026-09-26), confirmed live: same shape as the auto-compaction preamble
     # above -- the underlying Claude Code CLI's own native `/loop` autonomous-check
-    # feature resubmits this fixed English instructional prompt as a genuine role="user"
+    # feature resubmits a fixed English instructional prompt as a genuine role="user"
     # turn every time a scheduled wakeup fires, completely independent of Caroline's own
     # submit()/inject_proactive() (so _SYNTHETIC_TURN_MARKER never tags it either).
     # Confirmed live as the actual cause of a real incident: tab 1's last-5-real-user-
@@ -539,7 +539,18 @@ _SYNTHETIC_HISTORY_TEXT_PATTERNS = [
     # characters of the user's own (furious) Russian messages, and the "majority
     # language" resolver correctly, faithfully picked English -- the sample itself was
     # the bug, not the resolver.
-    re.compile(r"^# /loop — autonomous default with dynamic pacing", re.IGNORECASE),
+    #
+    # Widened (2026-09-27), confirmed live, same tab, same day: this originally matched
+    # only the literal heading "# /loop — autonomous default with dynamic pacing" (the
+    # ScheduleWakeup/dynamic-pacing variant) -- a SECOND /loop variant fired with a
+    # different heading, "# Autonomous loop check" (the CronCreate/autonomous-mode
+    # variant), 5921 chars of English against 90 total chars of real Russian, same exact
+    # failure. Rather than add a second literal string and keep chasing every future
+    # heading wording one at a time, match the STRUCTURE instead: any top-level markdown
+    # heading whose own line mentions both "autonomous" and "loop" -- true of every /loop
+    # variant's own heading, by construction, regardless of exact phrasing, and not
+    # something a real user's own first line would plausibly say by coincidence.
+    re.compile(r"^#\s(?=.{0,80}\bautonomous\b)(?=.{0,80}\bloop\b).*$", re.IGNORECASE | re.MULTILINE),
 ]
 
 # Bug fix (2026-09-25), confirmed live: Caroline's own auto-generated attachment
