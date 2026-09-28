@@ -55,7 +55,7 @@ INSTALLER_OUT := $(SCRIPT_DIR)/dist_installer
 # once too many separate $(shell) subprocess spawns land in the same
 # Makefile parse pass. Four total here stays well clear of that.
 BACKEND_SRC := $(shell find "$(BACKEND_DIR)/src" -type f 2>/dev/null)
-BACKEND_PY_SRC := $(shell find "$(BACKEND_PY_DIR)/app" -type f -name '*.py' 2>/dev/null) $(BACKEND_PY_DIR)/run_server.py
+BACKEND_PY_SRC := $(shell find "$(BACKEND_PY_DIR)/app" -type f -name '*.py' 2>/dev/null) $(BACKEND_PY_DIR)/run_server.py $(BACKEND_PY_DIR)/supervisor.py
 CAROLINE_SRC := $(shell find "$(CAROLINE_DIR)" -type f -not -path '*/bin/*' -not -path '*/obj/*' \( -name '*.cs' -o -name '*.xaml' -o -name '*.csproj' -o -path '*/wwwroot/*' \) 2>/dev/null)
 INSTALLER_SRC := $(shell find "$(INSTALLER_DIR)" -type f -not -path '*/bin/*' -not -path '*/obj/*' \( -name '*.cs' -o -name '*.csproj' -o -path '*/Assets/*' \) 2>/dev/null)
 XCFA_SRC := $(shell find "$(XCFA_DIR)" -type f -not -path '*/bin/*' -not -path '*/obj/*' -not -path '*/XcfaRenderer.Tests/*' -not -path '*/Demo/*' \( -name '*.cs' -o -name '*.csproj' \) 2>/dev/null)
@@ -110,10 +110,11 @@ $(OUT)/Caroline.exe: $(CAROLINE_SRC) $(XCFA_SRC) $(BACKEND_DIR)/mcp-servers/.sta
 	cp -r "$(BACKEND_DIR)/python-scripts" "$(OUT)/backend/python-scripts" & \
 	wait
 	cp "$(BACKEND_DIR)/package.json" "$(OUT)/backend/package.json"
-	@echo "--- backend-py (the live backend -- see BackendProcess.cs) ---"
+	@echo "--- backend-py (the live backend -- see Native/SupervisorClient.cs) ---"
 	mkdir -p "$(OUT)/backend-py"
 	cp -r "$(BACKEND_PY_DIR)/app" "$(OUT)/backend-py/app"
 	cp "$(BACKEND_PY_DIR)/run_server.py" "$(OUT)/backend-py/run_server.py"
+	cp "$(BACKEND_PY_DIR)/supervisor.py" "$(OUT)/backend-py/supervisor.py"
 	find "$(OUT)/backend-py/app" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 	mkdir -p "$(OUT)/backend-py/python-scripts"
 	cp "$(BACKEND_DIR)/python-scripts/local_tts_server.py" "$(OUT)/backend-py/python-scripts/local_tts_server.py"

@@ -24,7 +24,7 @@ public partial class MainWindow : Window
 {
     private readonly AppSettings _settings;
     private readonly SettingsService _settingsService;
-    private readonly BackendProcess _backend = new();
+    private readonly SupervisorClient _supervisor = new();
     private readonly TrayIconManager _tray;
     private GlobalHotkeyService? _hotkey;
     private bool _exitRequested;
@@ -160,20 +160,19 @@ public partial class MainWindow : Window
         _ = _activeTab?.WebView?.CoreWebView2?.ExecuteScriptAsync("window.carolineToggleVoiceRecording && window.carolineToggleVoiceRecording();");
     }
 
-    // Backend-crash restart policy -- same shape as the backend's own
-    // internal MAX_RESTARTS_PER_WINDOW guard against a session that keeps
-    // dying (server.ts's handleFailure): a handful of quick auto-restarts
-    // are fine (transient), but a backend that keeps crashing needs a human,
-    // not an infinite respawn loop silently burning CPU/battery.
-    private readonly List<DateTime> _backendRestartTimestamps = new();
-    private const int MaxBackendRestartsPerWindow = 5;
-    private static readonly TimeSpan BackendRestartWindow = TimeSpan.FromMinutes(10);
-    private BackendHealthWatchdog? _healthWatchdog;
-    // One per open tab, created/disposed alongside AddTabAsync/CloseTabAsync
-    // -- see BackendHealthWatchdog's own doc comment for why this replaced
-    // the single shared instance's old "check primary, kill everything"
-    // design (2026-09-08).
-    private readonly Dictionary<string, BackendHealthWatchdog> _tabWatchdogs = new();
+    // Per explicit instruction (2026-09-27): backend-crash restart policy,
+    // health polling (whole-process AND per-tab), and the rate-limit that
+    // used to live here (a handful of quick auto-restarts are fine, a
+    // backend that keeps crashing needs a human) all moved to
+    // backend-py/supervisor.py -- see SupervisorClient.cs and that file's
+    // own module docstring. This poller only checks ONE thing: has the
+    // supervisor given up auto-restarting? That's the one case still worth
+    // a human-visible ShowError; everything else is silent/log-only, same
+    // as before (see the old RestartBackend's own "no message box for this,
+    // deliberately" comment, preserved in spirit here).
+    private System.Threading.Timer? _supervisorStatusTimer;
+    private static readonly TimeSpan SupervisorStatusPollInterval = TimeSpan.FromSeconds(15);
+    private bool _gaveUpErrorShown;
     private readonly HttpClient _statusHttp = new() { Timeout = TimeSpan.FromSeconds(10) };
 
     private int _onLoadedCallCount;
@@ -181,24 +180,29 @@ public partial class MainWindow : Window
     private async void OnLoaded(object sender, RoutedEventArgs e)
     {
         _onLoadedCallCount++;
-        Logger.Log($"MainWindow.OnLoaded: starting backend (call #{_onLoadedCallCount} -- WPF's Loaded event " +
-            "firing more than once would explain a stray/duplicate health watchdog; logging this to confirm or rule it out)");
-        _backend.OutputLine += line => Logger.Log($"[backend] {line}");
-        // Bug fix (2026-09-11), per a real live incident: this used to be a BLOCKING
-        // Dispatcher.Invoke. Crashed fires from Process.Exited's own callback machinery, and
-        // synchronously waiting for the UI thread to run RestartBackend -> BackendProcess.Dispose()
-        // -> Process.Dispose() on that SAME Process object, while its Exited callback is still
-        // "in flight", deadlocks on Process's internal wait-handle unregistration -- confirmed
-        // live: froze the entire window for 40+ minutes. BeginInvoke lets Process.Exited's own
-        // callback return immediately; RestartBackend then runs later, genuinely outside that
-        // callback's call stack, so this specific reentrancy can't happen anymore. (See also
-        // BackendProcess.Dispose()'s own 5s timeout bound, added as a backstop alongside this.)
-        _backend.Crashed += () => Dispatcher.BeginInvoke(() =>
+        Logger.Log($"MainWindow.OnLoaded: starting supervisor (call #{_onLoadedCallCount})");
+        _supervisor.OutputLine += line => Logger.Log($"[backend] {line}");
+        // If the SUPERVISOR itself dies (not the backend it manages -- crash/
+        // freeze detection and rate-limited restart for THAT is entirely its
+        // own job now, see SupervisorClient's own doc comment and backend-py/
+        // supervisor.py's module docstring), nothing is managing the backend
+        // anymore -- try relaunching it once.
+        _supervisor.Crashed += () => Dispatcher.BeginInvoke(() =>
         {
-            try { RestartBackend("crashed"); }
-            catch (Exception ex) { Logger.Log($"MainWindow: RestartBackend threw while handling Crashed: {ex}"); }
+            Logger.Log("MainWindow: supervisor process exited unexpectedly -- relaunching");
+            try
+            {
+                if (!_supervisor.Start())
+                {
+                    ShowError("Caroline's supervisor could not be restarted. Check caroline.log, or restart the app.\n\n" + Logger.LogPath);
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Log($"MainWindow: relaunching the supervisor threw: {ex}");
+            }
         });
-        if (!_backend.Start())
+        if (!_supervisor.Start())
         {
             ShowError("Backend failed to start -- is Node.js installed?");
             return;
@@ -207,223 +211,39 @@ public partial class MainWindow : Window
         try { _appBrowserHost.Start(); }
         catch (Exception ex) { Logger.Log($"MainWindow: AppBrowserHost.Start() threw: {ex}"); }
 
-        // Independent of anything inside the backend's own event loop -- see
-        // BackendHealthWatchdog's doc comment for why that matters (it can
-        // catch a full event-loop freeze that no internal timer ever could).
-        // Process.Kill(entireProcessTree:true) inside RestartBackend works
-        // fine even on a fully-frozen process (it's a kernel-level
-        // TerminateProcess, doesn't need the target to cooperate).
-        _healthWatchdog = new BackendHealthWatchdog(BackendProcess.Port);
-        _healthWatchdog.LogLine += line => Logger.Log(line);
-        _healthWatchdog.Frozen += (reason) =>
-        {
-            // Logged BEFORE Dispatcher.Invoke, on the watchdog's own
-            // thread-pool thread -- so if the invoke itself never runs (UI
-            // thread stuck, exception swallowed somewhere, whatever), the
-            // log still shows the event actually fired and was handed off,
-            // narrowing "did Frozen fire?" vs "did the UI-thread handler run?"
-            // instead of having to guess between them again.
-            Logger.Log($"MainWindow: Frozen event received (reason: {reason}) -- dispatching to UI thread");
-            try
-            {
-                // BeginInvoke (2026-09-11), not Invoke -- see the Crashed handler's own comment
-                // above for the deadlock this class of bug can cause. Frozen fires from
-                // BackendHealthWatchdog's own thread rather than Process.Exited, so the specific
-                // reentrancy there doesn't apply here, but there's no reason for this thread to
-                // block on RestartBackend either, and consistency matters more than a provably
-                // narrower fix.
-                Dispatcher.BeginInvoke(() =>
-                {
-                    Logger.Log($"MainWindow: external health check says the backend is unresponsive: {reason}");
-                    try
-                    {
-                        // No message box for this, deliberately -- explicit
-                        // user request (2026-08-31, reaffirmed 2026-09-05):
-                        // routine auto-restarts must be silent (they were
-                        // confirmed live to stack into multiple blocking
-                        // dialogs when the backend needed several restarts in
-                        // a row), reasons belong in caroline.log, not a
-                        // popup. Even repeated failures never escalate to a
-                        // blocking dialog anymore -- see server.ts's
-                        // handleFailure, which backs off and retries forever
-                        // instead of giving up.
-                        RestartBackend("stopped responding (detected externally)");
-                    }
-                    catch (Exception ex)
-                    {
-                        Logger.Log($"MainWindow: RestartBackend threw while handling Frozen: {ex}");
-                    }
-                });
-            }
-            catch (Exception ex)
-            {
-                Logger.Log($"MainWindow: Dispatcher.Invoke for Frozen threw: {ex}");
-            }
-        };
+        // The supervisor's own health-poll loop autonomously detects and
+        // recovers a frozen/crashed backend (whole-process AND per-tab)
+        // without any help from here. This timer only watches for the one
+        // case still worth a human-visible dialog -- see PollSupervisorStatus.
+        _supervisorStatusTimer = new System.Threading.Timer(_ => PollSupervisorStatus(), null, SupervisorStatusPollInterval, SupervisorStatusPollInterval);
 
         await InitTabsAsync();
     }
 
     /// <summary>
-    /// Recovers ONE stuck tab without touching the shared backend process or
-    /// any other tab -- the tab-scoped counterpart to RestartBackend (see its
-    /// own doc comment for why that one still exists, whole-process-only,
-    /// for genuine unreachability). Fetches this tab's own cliProcessPid from
-    /// /api/status (added 2026-09-08 specifically for this) and kills just
-    /// that OS process tree directly, in-process (same TerminateProcess
-    /// primitive AppBrowserHost's /kill_process already exposes to the Node
-    /// side -- no need to go through that HTTP bridge here, this IS that
-    /// same .NET process). Killing it ends that tab's own query() stream,
-    /// which the backend's OWN internal handleFailure already notices and
-    /// recovers from on its own (fresh query(), resumed session, the
-    /// existing watchdogNote telling Caroline what happened) -- no separate
-    /// "tell the backend to restart" call needed.
+    /// Per explicit instruction (2026-09-27): the only thing MainWindow
+    /// still needs to know about backend health, now that supervisor.py
+    /// owns detection/recovery itself -- has it given up auto-restarting
+    /// (needed rescue more than MaxRestartsPerWindow times)? Every routine
+    /// restart, whole-process or per-tab, stays silent/log-only, same as
+    /// the old RestartBackend's own "no message box for this, deliberately"
+    /// policy (explicit user request, 2026-08-31/09-05) -- this is the one
+    /// case that still surfaces a dialog, shown exactly once per session.
     /// </summary>
-    private async void RecoverTab(string tabId, string reason)
+    private async void PollSupervisorStatus()
     {
-        Logger.Log($"MainWindow.RecoverTab({tabId}): entered (reason={reason})");
-        try
+        if (_gaveUpErrorShown) return;
+        var status = await _supervisor.GetStatusAsync();
+        if (status == null) return;
+        if (status.Value.TryGetProperty("gaveUp", out var gaveUp) && gaveUp.ValueKind == JsonValueKind.True)
         {
-            using var resp = await _statusHttp.GetAsync($"http://127.0.0.1:{BackendProcess.Port}/api/status");
-            if (!resp.IsSuccessStatusCode)
+            _gaveUpErrorShown = true;
+            Dispatcher.BeginInvoke(() =>
             {
-                Logger.Log($"MainWindow.RecoverTab({tabId}): /api/status returned {(int)resp.StatusCode} -- can't identify this tab's pid, giving up (the whole-process watchdog will catch it if the backend itself is actually down)");
-                return;
-            }
-            var body = await resp.Content.ReadAsStringAsync();
-            using var doc = JsonDocument.Parse(body);
-            if (!doc.RootElement.TryGetProperty("tabs", out var tabs) || tabs.ValueKind != JsonValueKind.Array)
-            {
-                Logger.Log($"MainWindow.RecoverTab({tabId}): /api/status response has no tabs[] array -- giving up");
-                return;
-            }
-            int? pid = null;
-            foreach (var t in tabs.EnumerateArray())
-            {
-                if (t.TryGetProperty("tabId", out var id) && id.GetString() == tabId)
-                {
-                    if (t.TryGetProperty("cliProcessPid", out var p) && p.ValueKind == JsonValueKind.Number) pid = p.GetInt32();
-                    break;
-                }
-            }
-            if (pid == null)
-            {
-                Logger.Log($"MainWindow.RecoverTab({tabId}): no cliProcessPid known for this tab yet (query() may still be starting) -- nothing to kill, backend's own internal watchdog is still the primary recovery path here");
-                return;
-            }
-            try
-            {
-                using var proc = Process.GetProcessById(pid.Value);
-                proc.Kill(entireProcessTree: true);
-                Logger.Log($"MainWindow.RecoverTab({tabId}): killed pid={pid} and its tree -- backend's own handleFailure will resume this tab's session with a fresh query()");
-            }
-            catch (ArgumentException)
-            {
-                Logger.Log($"MainWindow.RecoverTab({tabId}): pid={pid} already gone -- nothing to do");
-            }
-            // Same reasoning as RestartBackend's own NotifyBackendRestarted
-            // call: without this, this tab's own watchdog could declare it
-            // frozen again 60-90s later, while the fresh query() is still
-            // legitimately starting up, before it's even had a chance.
-            if (_tabWatchdogs.TryGetValue(tabId, out var tabWatchdog)) tabWatchdog.NotifyBackendRestarted();
+                Logger.Log("MainWindow: supervisor reports it has given up auto-restarting the backend");
+                ShowError("Caroline's backend keeps failing. Check caroline.log, or restart the app.\n\n" + Logger.LogPath);
+            });
         }
-        catch (Exception ex)
-        {
-            Logger.Log($"MainWindow.RecoverTab({tabId}): failed: {ex}");
-        }
-    }
-
-    /// <summary>
-    /// Shared by both recovery paths: BackendProcess.Crashed (the process
-    /// exited on its own) and BackendHealthWatchdog.Frozen (the process is
-    /// alive but not answering at all -- see that class's own doc comment
-    /// for why that's the one case left genuinely whole-process). Same
-    /// MaxBackendRestartsPerWindow give-up threshold either way: a backend
-    /// that keeps needing rescue, whether by crashing or by being completely
-    /// unreachable, needs a human, not an infinite respawn loop. One backend
-    /// process serves every tab (see the `sessions` map on the Node side),
-    /// so THIS restart is shared across all of them, not per-tab -- a single
-    /// stuck tab is RecoverTab's job instead (see its own doc comment), not
-    /// this one's.
-    /// </summary>
-    private void RestartBackend(string reasonForLog, string? extraUserNote = null)
-    {
-        Logger.Log($"MainWindow.RestartBackend: entered (reason={reasonForLog}, thread={Environment.CurrentManagedThreadId}, isUIThread={Dispatcher.CheckAccess()})");
-        var now = DateTime.UtcNow;
-        _backendRestartTimestamps.RemoveAll(t => now - t > BackendRestartWindow);
-        _backendRestartTimestamps.Add(now);
-        if (_backendRestartTimestamps.Count > MaxBackendRestartsPerWindow)
-        {
-            Logger.Log($"MainWindow: backend needed rescue ({reasonForLog}) {_backendRestartTimestamps.Count} times in {BackendRestartWindow.TotalMinutes} min -- giving up auto-restart.");
-            ShowError("Caroline's backend keeps failing. Check caroline.log, or restart the app.\n\n" + Logger.LogPath);
-            return;
-        }
-
-        Logger.Log($"MainWindow: restarting backend ({reasonForLog}) (attempt {_backendRestartTimestamps.Count}/{MaxBackendRestartsPerWindow})");
-        // Kill(entireProcessTree:true) -- confirmed necessary, not just
-        // belt-and-suspenders: a plain Kill() on just this direct child left
-        // its own grandchildren (claude.exe and, under it, every MCP server
-        // subprocess) running as orphans across restarts, confirmed live as
-        // dozens of accumulated stray node.exe processes over a single day
-        // of intermittent crashes/restarts (2026-08-30).
-        Logger.Log("MainWindow.RestartBackend: disposing old backend process...");
-        var disposeStart = DateTime.UtcNow;
-        _backend.Dispose();
-        Logger.Log($"MainWindow.RestartBackend: old backend disposed in {(DateTime.UtcNow - disposeStart).TotalSeconds:F1}s, starting new one...");
-        var startStart = DateTime.UtcNow;
-        bool started;
-        try
-        {
-            started = _backend.Start();
-        }
-        catch (Exception ex)
-        {
-            Logger.Log($"MainWindow.RestartBackend: _backend.Start() threw after {(DateTime.UtcNow - startStart).TotalSeconds:F1}s: {ex}");
-            ShowError($"Backend could not be restarted: {ex.Message}");
-            return;
-        }
-        Logger.Log($"MainWindow.RestartBackend: _backend.Start() returned {started} after {(DateTime.UtcNow - startStart).TotalSeconds:F1}s");
-        if (started)
-        {
-            // Root-caused live on 2026-08-31: without this, the health
-            // watchdog kept declaring THIS fresh process "frozen" (it just
-            // needs normal startup time, especially under heavy system
-            // load) and killing it before it ever finished coming up --
-            // an exact-clockwork restart every ~60s, forever. See
-            // BackendHealthWatchdog.NotifyBackendRestarted's own comment.
-            _healthWatchdog?.NotifyBackendRestarted();
-            // A whole-process restart means every open tab's own query() is
-            // about to cold-start too -- same "don't judge it before it's
-            // had a chance" reasoning as the line above, just extended to
-            // every per-tab watchdog instead of only the shared one.
-            foreach (var tabWatchdog in _tabWatchdogs.Values) tabWatchdog.NotifyBackendRestarted();
-        }
-        if (!started)
-        {
-            ShowError("Backend could not be restarted -- is Node.js installed?");
-            return;
-        }
-        if (extraUserNote != null)
-        {
-            // MessageBox.Show(this, ...) is modal -- it blocks this thread
-            // until dismissed. If the window was hidden to tray (Hide(),
-            // not Close() -- see OnClosing/ToggleVisibility) when this
-            // fires, an owned MessageBox can end up not actually visible to
-            // the user while still blocking, which would silently stall
-            // every recovery after it forever (confirmed live: exactly one
-            // "restarting backend" log line ever appeared across hours of
-            // repeated freezes, then nothing -- consistent with this).
-            // ShowAndActivate() first guarantees the owner window (and so
-            // the dialog) is actually on screen and focused.
-            Logger.Log("MainWindow.RestartBackend: showing MessageBox to the user (this call blocks until dismissed) -- forcing window visible first");
-            ShowAndActivate();
-            System.Windows.MessageBox.Show(this, extraUserNote, "Caroline restarted", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Warning);
-            Logger.Log("MainWindow.RestartBackend: MessageBox dismissed.");
-        }
-        // Every open tab's own chat.js WS reconnect loop (ws.onclose -> retry
-        // every 1.5s) picks the new backend up on its own once it's listening
-        // again -- no need to reload any WebView2 page for this case.
-        Logger.Log("MainWindow.RestartBackend: done.");
     }
 
     // --- Multi-tab chat (up to MaxTabs concurrent, independent conversations) ---
@@ -625,14 +445,10 @@ public partial class MainWindow : Window
         RebuildTabStrip();
         PersistOpenTabIds();
 
-        // Per explicit instruction (2026-09-08): a stuck tab must be
-        // recoverable on its own, without taking every other tab down --
-        // see BackendHealthWatchdog's own doc comment. One instance per
-        // open tab, disposed in CloseTabAsync.
-        var tabWatchdog = new BackendHealthWatchdog(BackendProcess.Port, tabId);
-        tabWatchdog.LogLine += line => Logger.Log(line);
-        tabWatchdog.TabFrozen += (frozenTabId, reason) => Dispatcher.Invoke(() => RecoverTab(frozenTabId, reason));
-        _tabWatchdogs[tabId] = tabWatchdog;
+        // Per-tab stuck-turn detection/recovery moved to backend-py/
+        // supervisor.py (2026-09-27) -- it polls /api/status's own tabs[]
+        // directly, so no per-tab object needs to be created/disposed here
+        // in step with AddTabAsync/CloseTabAsync anymore.
 
         await InitWebViewForTabAsync(tab);
         if (selectAfter) SelectTab(tab);
@@ -900,10 +716,6 @@ public partial class MainWindow : Window
         _tabs.Remove(tab);
         TabContentHost.Children.Remove(tab.ContentHost);
         try { tab.WebView?.Dispose(); } catch (Exception ex) { Logger.Log($"CloseTabAsync({tab.Id}): WebView.Dispose() threw: {ex}"); }
-        if (_tabWatchdogs.Remove(tab.Id, out var tabWatchdog))
-        {
-            try { tabWatchdog.Dispose(); } catch (Exception ex) { Logger.Log($"CloseTabAsync({tab.Id}): tab watchdog Dispose() threw: {ex}"); }
-        }
 
         if (wasActive && _tabs.Count > 0)
         {
@@ -1426,13 +1238,7 @@ public partial class MainWindow : Window
 
         _tray.Dispose();
         _hotkey?.Dispose();
-        _healthWatchdog?.Dispose();
-        foreach (var tabWatchdog in _tabWatchdogs.Values)
-        {
-            try { tabWatchdog.Dispose(); }
-            catch (Exception ex) { Logger.Log($"MainWindow shutdown: tab watchdog Dispose() threw (ignored, exiting anyway): {ex.Message}"); }
-        }
-        _tabWatchdogs.Clear();
+        _supervisorStatusTimer?.Dispose();
         _statusHttp.Dispose();
         _appBrowserHost.Dispose();
         foreach (var tab in _tabs)
@@ -1440,6 +1246,10 @@ public partial class MainWindow : Window
             try { tab.WebView?.Dispose(); }
             catch (Exception ex) { Logger.Log($"MainWindow shutdown: WebView.Dispose() threw for tab {tab.Id} (ignored, exiting anyway): {ex.Message}"); }
         }
-        _backend.Dispose();
+        // Killing the supervisor's whole process tree also takes down the
+        // real backend it spawned as a child -- per explicit instruction
+        // (2026-09-27), the two still die together with the WPF app exactly
+        // like before, nothing survives a full Exit.
+        _supervisor.Dispose();
     }
 }

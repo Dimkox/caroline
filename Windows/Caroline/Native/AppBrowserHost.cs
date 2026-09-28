@@ -14,7 +14,8 @@ namespace Caroline.Native;
 /// call directly into this WPF process's WebView2 windows; it calls this
 /// tiny local HTTP server instead, same shape (and same reasoning: a local,
 /// same-machine-only, unauthenticated control surface) as server.ts's own
-/// /api/* that BackendHealthWatchdog polls in the opposite direction. Every
+/// /api/* that backend-py/supervisor.py polls in the opposite direction
+/// (BackendHealthWatchdog.cs, its C# predecessor, retired 2026-09-27). Every
 /// request that touches a window is marshaled onto the UI thread via
 /// Dispatcher -- WebView2/WPF objects can only be touched from there.
 ///
@@ -245,7 +246,8 @@ public sealed class AppBrowserHost : IDisposable
             // force-kill a running Caroline.exe from the OUTSIDE (Process.Kill) before an
             // update, which never runs Caroline's OWN cleanup code (App.xaml.cs's Dispose()
             // sequence -- AppBrowserHost.Dispose(), BackendProcess.Dispose() with its own
-            // controlled entireProcessTree kill, closing every WebView2 window properly)
+            // controlled entireProcessTree kill -- now SupervisorClient.Dispose(), same
+            // shape, see its own 2026-09-27 doc comment -- closing every WebView2 window properly)
             // at all; an external Kill() just tears down the OS process tree, hoping it
             // catches everything. Confirmed live as a real gap: a stray WebView2 renderer
             // process could still be found holding a file open under AppDir well after

@@ -10,8 +10,8 @@ namespace Caroline.Services;
 /// and restarts -- since diagnosing "why did it crash last time" is the
 /// whole point. Capped so it can't grow unbounded over weeks of use.
 ///
-/// Separate from the backend's own Node-side console output (also piped
-/// here via BackendProcess.OutputLine, see MainWindow) -- this file is the
+/// Separate from the backend's own console output (also piped here via
+/// SupervisorClient.OutputLine, see MainWindow) -- this file is the
 /// one place to look for *anything* that went wrong, WPF shell or backend.
 /// </summary>
 public static class Logger

@@ -82,7 +82,7 @@
   </Target>
 
   <!-- Same dev-time convenience, now for the ACTUAL live backend
-       (backend-py, see BackendProcess.cs). Without this, editing
+       (backend-py, see Native/SupervisorClient.cs). Without this, editing
        backend-py/app/*.py updates only the source tree, not this build
        output's own copy, so `dotnet build` + relaunch keeps running stale
        Python code with no error: the exact same silent-staleness trap
@@ -90,7 +90,7 @@
   <Target Name="SyncBackendPy" AfterTargets="Build">
     <ItemGroup>
       <BackendPyFiles Include="..\..\backend-py\app\**\*.py" Exclude="..\..\backend-py\app\**\__pycache__\**" />
-      <BackendPyEntry Include="..\..\backend-py\run_server.py" />
+      <BackendPyEntry Include="..\..\backend-py\run_server.py;..\..\backend-py\supervisor.py" />
     </ItemGroup>
     <Copy SourceFiles="@(BackendPyFiles)"
           DestinationFolder="$(OutDir)backend-py\app\%(RecursiveDir)"
