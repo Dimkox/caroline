@@ -106,11 +106,6 @@
   const swUpsellHint = document.getElementById("swUpsellHint");
   const swLoginBtn = document.getElementById("swLoginBtn");
 
-  const smsAccountStatus = document.getElementById("smsAccountStatus");
-  const smsApiKeyInput = document.getElementById("smsApiKeyInput");
-  const smsSenderInput = document.getElementById("smsSenderInput");
-  const smsAccountSaveBtn = document.getElementById("smsAccountSaveBtn");
-  const smsAccountRemoveBtn = document.getElementById("smsAccountRemoveBtn");
 
   // mode_get and sw_status are two independent control-op round trips (see their
   // handlers below) -- cached here so whichever one resolves last can still decide
@@ -1835,27 +1830,6 @@
       sendControl("own_anthropic_key_get");
       sendControl("mode_get");
       sendControl("chat_mode_get");
-    } else if (evt.op === "sms_account_get") {
-      try {
-        const s = JSON.parse(evt.stdout || "{}");
-        if (s.error) {
-          smsAccountStatus.textContent = `Status unavailable: ${s.error}`;
-        } else if (s.hasAccount) {
-          smsAccountStatus.textContent = s.sender ? `Account registered. Sender: ${s.sender}.` : "Account registered (shared SMTP2GO number).";
-        } else {
-          smsAccountStatus.textContent = "No SMTP2GO account registered.";
-        }
-      } catch {
-        smsAccountStatus.textContent = "Status unavailable.";
-      }
-    } else if (evt.op === "sms_account_set") {
-      if (!evt.ok) addBanner(`Could not save SMS account: ${evt.stderr || "unknown error"}`);
-      smsApiKeyInput.value = "";
-      smsSenderInput.value = "";
-      sendControl("sms_account_get");
-    } else if (evt.op === "sms_account_remove") {
-      if (!evt.ok) addBanner(`Could not remove SMS account: ${evt.stderr || "unknown error"}`);
-      sendControl("sms_account_get");
     } else if (evt.op === "login_submit") {
       sendControl("mode_get");
       sendControl("sw_status");
@@ -1997,7 +1971,6 @@
     sendControl("openai_key_get");
     sendControl("model_override_get");
     sendControl("ratatosk_status_get");
-    sendControl("sms_account_get");
   }
 
   // Renders the OpenAI settings block; while a browser sign-in is pending it
@@ -2093,14 +2066,6 @@
   });
   ownAnthropicKeyClearBtn.addEventListener("click", () => {
     sendControl("own_anthropic_key_set", { anthropicApiKey: null });
-  });
-  smsAccountSaveBtn.addEventListener("click", () => {
-    const key = smsApiKeyInput.value.trim();
-    if (!key) return;
-    sendControl("sms_account_set", { smtp2goApiKey: key, smtp2goSender: smsSenderInput.value.trim() || null });
-  });
-  smsAccountRemoveBtn.addEventListener("click", () => {
-    sendControl("sms_account_remove");
   });
   swLoginBtn.addEventListener("click", () => {
     sendControl("open_login_from_settings");

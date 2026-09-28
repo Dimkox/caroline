@@ -865,9 +865,12 @@ def follow_explicit_parameters_instruction() -> str:
     explicit correction after a live incident traced to that tuple's total
     size: this genuinely belongs on demand, fetched wherever a task takes
     a concrete user-specified parameter -- email_plugin (recipient/
-    content), scheduler_plugin (time), sms_plugin (recipient/content) --
-    rather than unconditionally inlined into every turn regardless of
-    whether such a parameter is even in play this turn."""
+    content), scheduler_plugin (time), companion_plugin (recipient/
+    content -- sms_plugin's own SMTP2GO-based SMS send, once the other
+    example here, was removed 2026-09-27 in favor of this one, the only
+    SMS-sending path left) -- rather than unconditionally inlined into
+    every turn regardless of whether such a parameter is even in play
+    this turn."""
     return (
         "When the user gives you a specific, concrete parameter for a task -- a time, a date, a price or budget "
         "ceiling, a quantity, which option to pick among several, who to contact -- treat it as fixed, not a "

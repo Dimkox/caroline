@@ -43,7 +43,6 @@ from app.plugins.sw_api import mint_v2_session
 from app.plugins.viewer_plugin import take_viewer_request
 from app.plugins.voice_api import clean_text_for_speech, synthesize_speech, transcribe_audio, voice_for_gender
 from app.ratatosk_channel import get_ratatosk_channel_status, start_ratatosk_owner_channel, start_ratatosk_presence_heartbeat
-from app.sms_account import get_sms_account_status, remove_sms_account, set_sms_account
 from app.subscription_mode import (
     chat_mode_eligible, create_topup_checkout_url, get_claude_auth_status, get_own_anthropic_api_key, get_sw_status,
     invalidate_claude_auth_status, invalidate_sw_status, resolve_mode, run_account_state_refresher, set_own_anthropic_api_key,
@@ -972,20 +971,6 @@ async def handle_control_request(
         log_event("engine", "own_anthropic_key_set", clearing=not parsed.get("anthropicApiKey"))
         set_own_anthropic_api_key(WORKSPACE_DIR, parsed.get("anthropicApiKey") or None)
         return {"type": "control_response", "op": op, "ok": True, "requestId": request_id}
-    if op == "sms_account_get":
-        status = await get_sms_account_status()
-        log_event("engine", "sms_account_get", has_account=status["hasAccount"], error=status.get("error"))
-        return {"type": "control_response", "op": op, "ok": True, "stdout": json.dumps(status), "requestId": request_id}
-    if op == "sms_account_set":
-        if not parsed.get("smtp2goApiKey"):
-            return {"type": "control_response", "op": op, "ok": False, "stderr": "sms_account_set requires smtp2goApiKey", "requestId": request_id}
-        result = await set_sms_account(parsed["smtp2goApiKey"], parsed.get("smtp2goSender") or None)
-        log_event("engine", "sms_account_set", ok=result["ok"])
-        return {"type": "control_response", "op": op, "ok": result["ok"], "stderr": result.get("error"), "requestId": request_id}
-    if op == "sms_account_remove":
-        result = await remove_sms_account()
-        log_event("engine", "sms_account_remove", ok=result["ok"])
-        return {"type": "control_response", "op": op, "ok": result["ok"], "stderr": result.get("error"), "requestId": request_id}
     if op == "open_payment_from_settings":
         log_event("engine", "open_payment_from_settings")
         try:

@@ -68,6 +68,7 @@ from app.plugins.companion_api import (
 )
 from app.plugins.companion_sms_store import last_synced_at, list_all_threads, list_messages, list_threads, load_store
 from app.plugins.loader import Plugin, PluginTool
+from app.policies import follow_explicit_parameters_instruction
 from app.session_context import get_send, get_tab_id
 from app.sw_gate import require_sw_or_prompt
 from app.workspace_dir import WORKSPACE_DIR
@@ -277,7 +278,8 @@ def _usage_instructions() -> str:
         "minutes\"), set that up with schedule_reminder the same way you would for \"check my email every "
         "morning\" -- on each firing, call companion_list_sms_threads(unreadOnly=true) and reply with exactly "
         "[[NO_UPDATE]] if there's genuinely nothing new. Each thread's own threadId already encodes which phone "
-        "it's from -- pass it straight to companion_read_sms_thread, no fromNumber needed there."
+        "it's from -- pass it straight to companion_read_sms_thread, no fromNumber needed there.\n\n"
+        + follow_explicit_parameters_instruction()
     )
 
 
