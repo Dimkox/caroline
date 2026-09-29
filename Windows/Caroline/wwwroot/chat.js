@@ -500,7 +500,21 @@
       // Substring match, same as the other filters. Re-persist only when
       // something was actually removed, so this is a cheap idempotent
       // self-heal on every load.
-      const cleaned = list.filter((e) => !(e && typeof e.text === "string" && e.text.includes("[[NO_UPDATE]]")));
+      //
+      // Same idea (2026-09-29), per explicit instruction: the CLI's own
+      // "PreCompact callback" recap -- a raw <analysis>/<summary> block --
+      // leaked into chat as a real reply before chat_session.py's own fix
+      // (forced_compaction_result_pending now covers native auto-
+      // compaction, not just our forced "/compact"). That fix only stops
+      // NEW leaks; one already sat in this tab's stored transcript since
+      // before it deployed and kept re-rendering on every load. "PreCompact
+      // callback" is a stable, structurally-generated phrase (see
+      // compact_continuation_is_genuine_instruction() server-side) no real
+      // user or Caroline reply would ever contain -- safe as a substring
+      // match, same as NO_UPDATE above.
+      const cleaned = list.filter((e) => !(e && typeof e.text === "string" && (
+        e.text.includes("[[NO_UPDATE]]") || e.text.includes("PreCompact callback")
+      )));
       if (cleaned.length !== list.length) {
         try { localStorage.setItem(TRANSCRIPT_KEY, JSON.stringify(cleaned)); } catch { /* quota/private mode */ }
       }
