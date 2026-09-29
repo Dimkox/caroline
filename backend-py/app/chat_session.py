@@ -2835,9 +2835,35 @@ class ChatSession:
         session was abandoned after an internal error", which is simply
         false after an ordinary compaction. Nothing is copied now; the
         24h-dialogue file (recent_dialogue_history_instruction) is the
-        recall path, and it reads the live file's tail. Observation only."""
+        recall path, and it reads the live file's tail. Observation only.
+
+        Bug fix (2026-09-28), confirmed live from a real incident (tab 1,
+        18:58 EDT): forced_compaction_result_pending -- the flag that
+        suppresses the compaction round-trip's own AssistantMessage/
+        ResultMessage traffic from ever reaching the client as a chat
+        bubble -- was ONLY ever set by our own forced_compaction() before
+        it pushes "/compact" (see that method). The CLI's OWN native
+        auto-compaction (context grew too large mid-turn, no "/compact"
+        from us) fires this exact same hook but never went through that
+        method, so nothing suppressed it -- the model's raw <analysis>/
+        <summary> compaction recap (see compact_continuation_is_genuine_
+        instruction, which correctly tells the model to WRITE this, but
+        says nothing about who should ever SEE it) sailed straight through
+        to the user as an ordinary reply. Setting it here too, for BOTH
+        triggers, makes suppression unconditional on which path caused
+        the compaction -- a no-op when forced_compaction() already set it.
+        See _handle_failure's own matching fix: this flag now gets cleared
+        on ANY stream teardown, not just an engine switch, specifically so
+        a crash mid-compaction (confirmed live: this exact incident ended
+        in a ClosedResourceError right after the leaked text, before any
+        ResultMessage could clear it) can never leave it stuck True and
+        silently mute every later reply."""
         trigger = hook_input.get("trigger") if isinstance(hook_input, dict) else None
-        log_event("engine", "pre_compact_observed", tab_id=self.tab_id, trigger=trigger)
+        log_event(
+            "engine", "pre_compact_observed", tab_id=self.tab_id, trigger=trigger,
+            was_already_suppressed=self.forced_compaction_result_pending,
+        )
+        self.forced_compaction_result_pending = True
         return {}
 
     def _handle_balance_exhausted(self) -> str:
@@ -3735,6 +3761,22 @@ class ChatSession:
             "engine", "handle_failure_entered", tab_id=self.tab_id, hang_count=self.hang_count,
             turn_pending=self.turn_pending, error=str(exc), error_chain=_format_exception_chain(exc),
         )
+        # Bug fix (2026-09-28), confirmed live from a real incident: a crash
+        # mid-compaction (ClosedResourceError right after the compaction
+        # round-trip's own AssistantMessage) left forced_compaction_result_
+        # pending stuck True forever, since nothing else on this path ever
+        # clears it -- switch_engine_if_needed() already had this exact fix
+        # for its own trigger (see its own comment: "leaving forced_
+        # compaction_result_pending=True stuck ... silently hid every
+        # subsequent reply from the client forever"), but only for an
+        # engine switch specifically. Generalized here: ANY stream teardown
+        # of ANY cause invalidates whatever fake-result bookkeeping belonged
+        # to that now-dead stream -- the replay/reconnect that follows is a
+        # real turn (or a real fresh compaction attempt) and must not be
+        # permanently muted by a flag left over from the one that crashed.
+        if self.forced_compaction_result_pending:
+            self.forced_compaction_result_pending = False
+            self._drain_compaction_queue()
         # Bug fix (2026-09-26), per explicit instruction ("Таймер надо сбрасывать каждый
         # раз. Никогда не сдаваться" -- reset the ceiling's clock on every reconnect,
         # never give up outright): turn_pending_since (see its own property-setter

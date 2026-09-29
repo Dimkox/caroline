@@ -174,59 +174,6 @@ def _gender_agreement_clause(gender: str | None) -> str:
 # fail the same way again for the same reason. Each still ends in the same <translation>
 # tag contract so translate_text's own extraction/garbage-filter logic doesn't need to
 # know which variant answered.
-def _translate_prompt_tagged(text: str, language: str, gender_clause: str) -> str:
-    """Variant 1 -- the original wording: explicit "translate", explains the
-    already-in-that-language case, and calls out code/paths/URLs to leave untouched."""
-    return (
-        f"Translate the following text into {language}." + gender_clause + " If the text is already in that "
-        "language, respond with it unchanged (or only lightly cleaned up) -- do not refuse or explain, "
-        "translation into the SAME language it's already in is a normal, valid case, not an error. Leave code "
-        "blocks/inline code, file paths, URLs, and other literal technical identifiers exactly as they are -- "
-        "translate only the surrounding natural-language prose, and preserve the original formatting/markdown "
-        "structure.\n\n"
-        f"Text to translate:\n---\n{text}\n---\n\n"
-        "Output format, follow exactly -- a program parses this, not a person: write ONLY the translated text "
-        "inside a <translation> tag, nothing else anywhere in your reply -- no JSON, no markdown wrapper, no "
-        "code fences around the WHOLE answer, no quotes around it, no explanation.\n"
-        "Example, for an unrelated hypothetical translation into French -- copy the TAG, not the words: "
-        "<translation>Il pleut à Paris aujourd'hui.</translation>"
-    )
-
-
-def _translate_prompt_pipeline(text: str, language: str, gender_clause: str) -> str:
-    """Variant 2 -- for a refusal-shaped first response: frames this explicitly as an
-    automated pipeline step with no one to ask/clarify with, not a request the model
-    could decline or hedge on, and drops the word "translate" up front in favor of
-    "rewrite ... in <language>" in case that word itself is what triggers a refusal-
-    shaped reply for borderline/technical-sounding input."""
-    return (
-        f"You are one step in an automated text pipeline, not a conversation -- there is no user to ask or "
-        f"clarify with. Rewrite the text below so it reads naturally in {language}, preserving its exact "
-        f"meaning." + gender_clause + " Any code, file paths, URLs, or literal technical identifiers in it stay "
-        "byte-for-byte unchanged; only the surrounding prose is rewritten. If it is already natural, fluent "
-        f"{language}, output it as-is -- that is a normal, expected outcome here, not a reason to explain "
-        "anything.\n\n"
-        f"INPUT:\n---\n{text}\n---\n\n"
-        "Respond with ONLY this exact tag, filled in, and absolutely nothing before or after it -- your whole "
-        f"reply must parse as this one tag: <translation>rewritten text goes here</translation>"
-    )
-
-
-def _translate_prompt_minimal(text: str, language: str, gender_clause: str) -> str:
-    """Variant 3 -- deliberately the shortest, plainest of the three, for the case where
-    the fuller instructions in the other two (the code/URL carve-out, the "already in
-    that language" explanation) are themselves what confuses a weak small model into a
-    garbage or off-format reply. No caveats, no examples -- just the task and the tag."""
-    return (
-        f"Rewrite this in {language}, same meaning, same formatting." + gender_clause + "\n\n"
-        f"{text}\n\n"
-        "Reply with only: <translation>...</translation>"
-    )
-
-
-_TRANSLATE_PROMPT_VARIANTS = [_translate_prompt_tagged, _translate_prompt_pipeline, _translate_prompt_minimal]
-
-
 async def translate_text(text: str, language: str, session: str | None = None, timeout: float = 30.0, gender: str | None = None) -> str | None:
     """Per explicit instruction (2026-09-13): the target language for a
     generated piece of text (progress narration, today) must come from
@@ -241,21 +188,6 @@ async def translate_text(text: str, language: str, session: str | None = None, t
     UNCONDITIONALLY on the final text as a forced correction pass, not
     conditionally based on a guess about whether it's "already right".
 
-    Confirmed live, twice: (1) CAROLINE_SW_KEY's ACL rejects the dedicated
-    ai:translate command outright ("Key scope/resource ACL does not
-    permit this call") -- same restriction resolve_user_language() above
-    already works around by going through the general-purpose ai:resolve
-    instead of the more specific ai:detectLanguage; same fix here. (2)
-    Once routed through ai:resolve, the SAME small-model failure modes as
-    generate_progress_comment() showed up here too (a JSON-wrapped refusal
-    -- "already in English... no translation can be generated" -- for a
-    perfectly ordinary translation request) -- same <tag> contract +
-    extraction + garbage/refusal filter as narration, not a bespoke
-    lighter check. Text already in the target language should come back
-    close to unchanged. Returns None on any failure OR on a garbage/
-    refusal-shaped response -- callers must fall back to the original
-    text, never block on this.
-
     Widened (2026-09-15), per explicit instruction: no longer narration-
     only. Confirmed live -- the real Claude model itself (not narration)
     can drop a terse English status line into an otherwise-Russian
@@ -263,79 +195,60 @@ async def translate_text(text: str, language: str, session: str | None = None, t
     marks in batches."), and language_hint_instruction's system-prompt
     nudge is advisory, not a hard guarantee. chat_session.py now runs
     EVERY real visible assistant text block through this too, not just
-    generate_progress_comment's filler. Two consequences of that widening,
-    both handled below: real replies can be far longer than a narration
-    aside, so the garbage filter's length cap is now sized off the INPUT
-    text's own length rather than the fixed narration-sized constant; and
-    a real reply can contain code/paths/technical content that must not be
-    translated along with the prose, so the prompt now says so explicitly.
+    generate_progress_comment's filler.
 
     `timeout` (2026-09-22): forwarded to _post_json's own per-attempt
     budget, default unchanged (30s) for the two real-visible-reply call
     sites (chat_session.py) -- narration passes a much shorter value, see
     generate_progress_comment's own doc comment for why.
 
-    Retries (2026-09-26), per explicit instruction ("3 с разными промптами"),
-    after a real incident: this used to be exactly one attempt -- any single
-    bad response (a refusal-shaped reply, an unparsable tag, the garbage
-    filter tripping) silently left the ORIGINAL English text on screen, with
-    nothing in the log to say why (none of this function's own log_event
-    calls fired -- confirmed live, tab 3, 2026-09-26: an English status line
-    reached the user and NO translate_text_* event exists for it in the log
-    at all, meaning the whole call path needs its own trail, not just this
-    function's insides). Now tries up to len(_TRANSLATE_PROMPT_VARIANTS) (3)
-    times, a DIFFERENT prompt phrasing each time rather than repeating the
-    identical one a refusal already rejected once, flat with no delay
-    between attempts (no exponential backoff, same rule as every other
-    retry in this codebase) -- falls back to the original text only once
-    every variant has been tried and failed."""
+    Rewritten (2026-09-28), per explicit instruction ("Используй ai:translate
+    вместо ai:resolve"), after a real incident traced to its actual root
+    cause: this used to route through the generic ai:resolve command with a
+    hand-written <translation>-tag prompt, retried across three differently
+    worded prompt variants (2026-09-26 fix) because that generic path kept
+    producing well-formed, non-refusal, correctly-tagged replies that were
+    simply still in the SOURCE language -- a failure the tag/refusal/length
+    checks below have no way to catch by construction, confirmed live (a
+    297-char reply that changed nothing about the actual language). The
+    ORIGINAL reason ai:resolve was used at all -- "CAROLINE_SW_KEY's ACL
+    rejects the dedicated ai:translate command outright" -- turned out to
+    be a real but fixable server-side restriction, not a permanent one:
+    the key's scope now explicitly grants ai:translate (see reforce's
+    key_scopes table, key id 17), confirmed live with a real call. ai:translate
+    is a purpose-built server-side translation function (AI.translateText),
+    not a generic instruction-following completion, so it needs no <tag>
+    contract, no extraction, and no multi-prompt retry -- one call, plain
+    text/language params. The garbage filter stays as defense-in-depth
+    (refusal/JSON-leak/wrong-script safety net), not the primary mechanism,
+    same philosophy as everywhere else it's used."""
+    body: dict[str, Any] = {
+        "command": "ai:translate", "key": CAROLINE_SW_KEY, "text": text, "language": language,
+        "instructions": _gender_agreement_clause(gender) or None,
+    }
+    if session:
+        body["session"] = session
+    try:
+        data = await _post_json(body, timeout=timeout)
+    except Exception as exc:
+        log_event("plugin:voice", "translate_text_failed", reason="request_failed", error=str(exc))
+        return None
+    if data.get(".status") != "ok" or not isinstance(data.get("result"), str):
+        log_event("plugin:voice", "translate_text_failed", reason="bad_response", status=data.get(".status"), api_reason=data.get(".reason"))
+        return None
+    translated = data["result"]
+    if not translated.strip():
+        log_event("plugin:voice", "translate_text_failed", reason="empty")
+        return None
+    # See _NARRATION_MAX_CHARS/_looks_like_narration_garbage's own comments --
+    # sized off the ORIGINAL text's own length, not the narration-sized
+    # constant, since a real reply being translated can legitimately be
+    # much longer than a narration aside.
     max_chars = max(_NARRATION_MAX_CHARS, len(text) * 3)
-    last_reason = "unknown"
-    for attempt, build_prompt in enumerate(_TRANSLATE_PROMPT_VARIANTS, start=1):
-        prompt = build_prompt(text, language, _gender_agreement_clause(gender))
-        # Bug fix (2026-09-13), confirmed live: model="SMALL" (openai/gpt-5-nano)
-        # just echoed the source text back unchanged instead of translating it,
-        # every time -- too weak for this specific task even with a clear tag
-        # contract and a correct explicit prompt. Leaving `model` unset (the
-        # account's own default/ALTERNATE tier) instead reliably produced a
-        # real, correct translation on the same exact input. This call exists
-        # specifically to GUARANTEE correctness (see this function's own
-        # docstring) -- worth the extra cost over SMALL, unlike the narration
-        # draft itself above, which stays SMALL on purpose.
-        body: dict[str, Any] = {"command": "ai:resolve", "key": CAROLINE_SW_KEY, "question": prompt}
-        if session:
-            body["session"] = session
-        try:
-            data = await _post_json(body, timeout=timeout)
-        except Exception as exc:
-            last_reason = f"request_failed: {exc}"
-            log_event("plugin:voice", "translate_text_attempt_failed", attempt=attempt, reason="request_failed", error=str(exc))
-            continue
-        if data.get(".status") != "ok" or not isinstance(data.get("result"), str):
-            last_reason = f"bad_response: {data.get('.reason')}"
-            log_event("plugin:voice", "translate_text_attempt_failed", attempt=attempt, reason="bad_response", status=data.get(".status"), api_reason=data.get(".reason"))
-            continue
-        translated = _extract_tagged_text(data["result"], "translation")
-        if not translated:
-            last_reason = "unextractable"
-            log_event("plugin:voice", "translate_text_attempt_failed", attempt=attempt, reason="unextractable", raw=data["result"][:300])
-            continue
-        # Bug fix (2026-09-15): _NARRATION_MAX_CHARS (400) is sized for
-        # narration's own short asides -- a real reply being translated can
-        # legitimately be much longer, so cap this at a generous multiple of
-        # the ORIGINAL text's own length instead (Russian in particular tends
-        # to run noticeably longer than English for the same content) rather
-        # than the fixed narration-sized constant, which would reject every
-        # long-but-correct translation as "garbage" by length alone.
-        if _looks_like_narration_garbage(translated, language, max_chars=max_chars):
-            last_reason = "rejected_garbage"
-            log_event("plugin:voice", "translate_text_attempt_failed", attempt=attempt, reason="rejected_garbage", text=translated[:300])
-            continue
-        if attempt > 1:
-            log_event("plugin:voice", "translate_text_succeeded_after_retry", attempt=attempt)
-        return translated
-    log_event("plugin:voice", "translate_text_exhausted", attempts=len(_TRANSLATE_PROMPT_VARIANTS), last_reason=last_reason)
-    return None
+    if _looks_like_narration_garbage(translated, language, max_chars=max_chars):
+        log_event("plugin:voice", "translate_text_failed", reason="rejected_garbage", text=translated[:300])
+        return None
+    return translated
 
 
 # Guards against the failure modes seen live rather than trusting any
@@ -436,6 +349,8 @@ _NARRATION_MAX_CHARS = 400
 # is only ever asked for in a European language; a CJK reply is the SMALL
 # model flailing, never legitimate here.
 _CJK_RE = re.compile(r"[぀-ヿ㐀-鿿가-힯]")
+_CYRILLIC_RE = re.compile(r"[Ѐ-ӿ]")
+_LATIN_LETTER_RE = re.compile(r"[A-Za-z]")
 
 
 def _looks_like_narration_garbage(text: str, language: str = "", max_chars: int = _NARRATION_MAX_CHARS) -> bool:
@@ -443,6 +358,21 @@ def _looks_like_narration_garbage(text: str, language: str = "", max_chars: int 
         return True
     if _CJK_RE.search(text) and not re.search(r"chin|japan|korea|mandarin|中文", language, re.IGNORECASE):
         return True
+    # Bug fix (2026-09-28), confirmed live via translate_text's own real
+    # incident: the CJK check above catches a wrong-script reply for a
+    # Chinese/Japanese/Korean target, but had no equivalent for Cyrillic --
+    # the one that actually bit in practice. A translation call can return
+    # well-formed, non-refusal, correctly-tagged prose that is simply still
+    # in the SOURCE language (confirmed live: a "translate into Russian"
+    # call whose entire reply was fluent, grammatical English -- nothing
+    # about it looked like a refusal, JSON leak, or garbage by any of the
+    # checks below, so it passed straight through). Same shape as the CJK
+    # check: when the target language is Cyrillic-scripted, a reply with
+    # real Latin letters and not a single Cyrillic one did not actually
+    # translate, regardless of how well-formed it otherwise reads.
+    if re.search(r"russ|ukrain|belarus|bulgar|serb|macedon", language, re.IGNORECASE):
+        if _LATIN_LETTER_RE.search(text) and not _CYRILLIC_RE.search(text):
+            return True
     return any(p.search(text) for p in _NARRATION_GARBAGE_PATTERNS)
 
 
