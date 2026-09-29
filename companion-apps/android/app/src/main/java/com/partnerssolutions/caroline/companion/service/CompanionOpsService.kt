@@ -71,6 +71,29 @@ class CompanionOpsService : Service() {
     private lateinit var contactsRepository: ContactsRepository
     private var lastHeartbeatAt = 0L
 
+    // Bug fix (2026-09-29), confirmed live from a real incident (phone
+    // logcat): onStartCommand fires again, on the SAME already-running
+    // instance, every time ANY of this service's own restart paths fires
+    // (START_STICKY, the onTaskRemoved/AlarmManager restart, BootReceiver,
+    // CompanionApplication.onCreate on every process start, the setup
+    // screen) -- see this class's own doc comment above. Without this
+    // guard, a bare `scope.launch { pollLoop() }` here added ANOTHER
+    // independent poll loop on every one of those triggers, none of them
+    // ever cancelled, all racing on the same shared outbox/heartbeat data
+    // forever. Confirmed live: exactly 3 concurrent loops on one phone,
+    // visible as tight clusters of 3 near-simultaneous log lines for
+    // EVERY tick (an ordinary SSL handshake failure, a heartbeat write --
+    // and, critically, 3 REAL SmsManager sends for one companion_sms_send
+    // call, since the existing "does the result path already exist yet"
+    // check is a check-then-act race, not atomic, and all 3 loops can
+    // pass it before any one of them finishes writing a result). One
+    // in-memory Job reference is enough -- this only needs to dedupe
+    // within ONE process's lifetime; a genuine process restart already
+    // gets a fresh Service instance (and this field resets with it),
+    // which is fine -- the OLD loop's coroutine scope dies with the OLD
+    // process.
+    private var pollJob: Job? = null
+
     override fun onCreate() {
         super.onCreate()
         smsRepository = SmsRepository(applicationContext)
@@ -81,7 +104,15 @@ class CompanionOpsService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForeground(NOTIFICATION_ID, buildNotification())
         Logger.i("CompanionOpsService started (deviceId=${CompanionPrefs.deviceId})")
-        scope.launch { pollLoop() }
+        // See pollJob's own field comment -- onStartCommand fires again on
+        // an already-running instance for every one of this service's own
+        // restart triggers; only launch a fresh loop if the previous one
+        // (if any) isn't still active.
+        if (pollJob?.isActive != true) {
+            pollJob = scope.launch { pollLoop() }
+        } else {
+            Logger.i("CompanionOpsService: poll loop already running, not starting a second one")
+        }
         return START_STICKY
     }
 
