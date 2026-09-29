@@ -212,7 +212,14 @@ async def get_mine(path: str) -> Any | None:
 
 async def get_all_mine(path: str = "") -> dict[str, Any]:
     """Reads a whole subtree as a dict ({} if the subtree doesn't exist
-    yet). `path` is relative to the caller's own namespace root."""
+    yet). `path` is relative to the caller's own namespace root.
+
+    Reads ONLY the .vlist living directly AT `path` -- never that node's
+    own child namespaces (see list_mine below for those). A value written
+    one level deeper, e.g. `f"{path}/<id>/info"`, is invisible to this
+    call no matter how deep it actually is -- confirmed live as the exact
+    cause of list_devices() always seeing zero paired phones (see
+    list_mine's own docstring)."""
     try:
         result = await _call("var:getAllMine", path=path)
     except SwApiError as exc:
@@ -221,6 +228,29 @@ async def get_all_mine(path: str = "") -> dict[str, Any]:
         raise
     value = result.get(".value")
     return value if isinstance(value, dict) else {}
+
+
+async def list_mine(path: str = "") -> list[str]:
+    """Names of the immediate CHILD namespaces (sub-folders) directly under
+    `path` -- e.g. list_mine("devices") returns every paired phone's
+    deviceId, regardless of whether anything was ever written directly ON
+    the "devices" node itself (get_all_mine("devices") would stay {} in
+    that case -- see its own docstring). Added 2026-09-29 alongside the
+    matching reforce server command (var:listMine) specifically to fix
+    list_devices(): the Android companion writes each phone's heartbeat to
+    devices/<deviceId>/info, one level below where a device's own id would
+    need to sit for get_all_mine to see it directly, and there was no
+    existing v2 command that could answer "what child paths exist here" at
+    all before this one. Confirmed live: 2 real paired phones existed on
+    disk the whole time get_all_mine("devices") was returning {}."""
+    try:
+        result = await _call("var:listMine", path=path)
+    except SwApiError as exc:
+        if "no such variable" in str(exc).lower():
+            return []
+        raise
+    value = result.get(".value")
+    return value if isinstance(value, list) else []
 
 
 async def set_mine(path: str, value: Any) -> None:
@@ -248,11 +278,31 @@ async def list_devices() -> list[dict[str, Any]]:
     """Every paired phone, read live from the device registry (no local
     caching -- this is cheap, and staleness would only ever be wrong in
     the direction of hiding a phone that just paired). `online` is a
-    best-effort hint from heartbeat recency, not a guarantee."""
-    raw = await get_all_mine("devices")
+    best-effort hint from heartbeat recency, not a guarantee.
+
+    Bug fix (2026-09-29), confirmed live from a real incident: this used
+    to call get_all_mine("devices") expecting {deviceId: {phoneNumber,
+    model, lastSeenAt}} directly -- but the Android companion writes each
+    phone's heartbeat to devices/<deviceId>/info, one level deeper (see
+    this module's own "Multi-phone support" docstring, and
+    CompanionOpsService.kt's matching comment), and get_all_mine only ever
+    reads a .vlist living directly at the given path, never a child
+    namespace's own contents. Nothing was ever written directly ON the
+    "devices" node itself, so this always returned {} regardless of how
+    many phones were actually paired and heartbeating -- confirmed live:
+    2 real devices existed in the registry (one an emulator, one a real
+    paired phone with a heartbeat minutes old) the whole time this
+    reported none. Two-step fix, matching the actual on-disk shape: list
+    the device ids as child namespace names (list_mine, the new v2
+    command this required -- there was no existing way to enumerate them
+    at all), then fetch each one's own info leaf individually. Concurrent,
+    not sequential -- a handful of phones at most, same "simplest correct
+    thing" call already made for this exact shape in _contacts_request."""
+    device_ids = await list_mine("devices")
+    infos = await asyncio.gather(*(get_mine(f"devices/{device_id}/info") for device_id in device_ids))
     now_ms = time.time() * 1000
     devices = []
-    for device_id, info in raw.items():
+    for device_id, info in zip(device_ids, infos):
         if not isinstance(info, dict):
             continue
         last_seen = info.get("lastSeenAt")
