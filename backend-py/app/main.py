@@ -1155,13 +1155,37 @@ async def ws_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
     log_event("ws", "connected", tab_id=tab_id)
 
+    # Bug fix (2026-09-29), confirmed live: the comment below ("previous
+    # connection's session is disposed on its own 'close'") assumed a
+    # second connection for the same tab_id only ever arrives AFTER the
+    # older one's own cleanup has already run (an ordinary client
+    # reconnect: close, then reopen) -- sessions[tab_id] = session a few
+    # lines down had no guard against a connection arriving WHILE an
+    # older one for the same tab_id is STILL open (confirmed live: a
+    # temporary debug WS connection to /?tab=1). That silently orphans
+    # the older session: its own eventual cleanup below no-ops forever
+    # after (the "is session" guard sees the dict already points
+    # elsewhere), yet its background loops (watchdog, check_hang_tick,
+    # the CLI process itself) keep running untouched -- unreachable from
+    # every dict-based lookup (/api/message, /api/status, any proactive
+    # inject) but still alive and consuming resources. Explicitly tear
+    # down any old session for this tab_id first, every time, so a
+    # duplicate/overlapping connect -- whatever its cause -- can never
+    # orphan one again.
+    old_session = sessions.get(tab_id)
+    if old_session is not None:
+        log_event("ws", "replacing_live_session", tab_id=tab_id)
+        old_session.dispose()
+        if sessions.get(tab_id) is old_session:
+            del sessions[tab_id]
+
     # A FRESH ChatSession every connection (not reused across reconnects) --
     # matches server.ts's own design exactly: continuity across a
     # disconnect/reconnect (or a full app restart) comes from the
     # FILE-BASED durability layer (tab-session-<id>.json, pending-turn-
     # <id>.json), not from in-memory state surviving on some stale object.
     # The previous connection's session (if any) is disposed on its own
-    # "close" below.
+    # "close" below, or right above if it was still live at connect time.
     session = ChatSession(tab_id=tab_id, workspace_dir=WORKSPACE_DIR, send=websocket.send_json)
     sessions[tab_id] = session
     await session.start()
